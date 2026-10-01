@@ -71,10 +71,23 @@ Rider / WhatsApp Vendor
       Payment Result
 ```
 
-### Model vs Code Responsibility
-- **What the Model Decides (LLM Interpreter)**: Structured extraction only — intent (`surge_missing`, `incentive_missing`, etc.), explicit trip IDs, claimed date strings, and clarification flags. The LLM is strictly prohibited from deciding money or payment authorization.
-- **What Code Decides (Deterministic Domain)**: Date normalization (e.g. `"18 ko"`, `"Sept 19"` → ISO dates), trip & payout database lookups, exact financial reconciliation, policy threshold evaluation (auto-pay ≤ ₹200/day, Ops approval > ₹200, escalation for > 7 days old), and PaySwift transaction execution with idempotency key locking.
-- **Fallback**: On LLM rate-limit/timeout, regex fallback extracts trip IDs (`T\d{5,7}`) and date patterns directly from raw text.
+### System Architecture & Workflow
+
+1. **Conversation Service (`POST /messages`)**: Receives rider text, loads past conversation context, and drives the workflow.
+2. **LLM Interpreter (NLU Layer)**: Extracts structured entities from raw text — intent (`surge_missing`, `incentive_missing`), explicit trip IDs, claimed date strings, and clarification flags.
+3. **Deterministic Domain Logic (Core Engine)**:
+   - **Date Resolution**: Converts relative text (`"kal"`, `"18 ko"`) into standard ISO calendar dates.
+   - **Reconciliation**: Queries trip and payout databases to calculate exact financial discrepancies.
+   - **Policy Evaluation**: Enforces rules — auto-pay for owed ≤ ₹200 (max 1/day per rider), Ops approval for > ₹200, and Ops escalation for disputes > 7 days old.
+4. **Execution & Operations**:
+   - **PaySwift Sandbox**: Dispatches payments with strict idempotency keys (`rider_id:date:amount`) to prevent double-payouts.
+   - **Ops Queue**: Routes high-value or stale disputes to human review (`GET /ops/pending`).
+
+### Model vs. Code Responsibilities
+
+- **What Model Decides**: Only text understanding (extracting intent, dates, trip IDs). The model **never** calculates amounts or authorizes money.
+- **What Code Decides**: All database lookups, financial math, policy thresholds, payment rules, and transaction execution.
+- **Fail-Safe Fallback**: On LLM rate-limit or timeout, regex logic extracts trip IDs (`T\d{5,7}`) and date patterns directly from raw text so processing never halts.
 
 ---
 
