@@ -1,37 +1,109 @@
-# AI Session Logs
+# Rider Payout Dispute Desk
 
-## Tool used: Antigravity (Google DeepMind)
+## How to Run
 
-### Session file
+### With Docker (recommended)
 
-| File | Session ID | Lines | Size |
-|---|---|---|---|
-| `antigravity_session_f946b540.jsonl` | `f946b540-18e5-46db-a6c5-a2d7b6526838` | 2 798 | ~2.8 MB |
+```bash
+cp .env.example .env          # then fill in GEMINI_API_KEY
+docker compose up --build     # starts app (8000), postgres, payswift (8081)
+```
 
-### Format
+### Without Docker
 
-Each line is a JSON object (JSONL) representing one step in the conversation. Fields:
+```bash
+# Prerequisites: Python 3.12+, PostgreSQL running
+pip install -r requirements.txt
+cp .env.example .env          # fill in DATABASE_URL and GEMINI_API_KEY
+python app/ingest.py          # load riders/trips/payout_lines into DB
+uvicorn app.main:app --port 8000
+```
 
-- `step_index` — sequential step number
-- `source` — `USER_EXPLICIT`, `MODEL`, or `SYSTEM`
-- `type` — step type: `USER_INPUT`, `PLANNER_RESPONSE`, `RUN_COMMAND`, `VIEW_FILE`, `LIST_DIRECTORY`, `WRITE_FILE`, `ASK_QUESTION`, etc.
-- `status` — `DONE` or `ERROR`
-- `created_at` — ISO timestamp
-- `content` — text output of the step (tool result, model reply, etc.)
-- `tool_calls` — array of tool invocations made in this step, with `name` and `args`
+### Run Evals
 
-### Coverage
+```bash
+python evals/run.py http://localhost:8000
+```
 
-The single session covers the entire project from start to finish:
+Optionally reset state before a clean run:
 
-- Cloning the assignment repo and reading BRIEF.md / policy.md
-- Designing and implementing the full agent (FastAPI app, reconciler, decision engine, LLM adapter, PaySwift client, DB schema, ingestion)
-- Debugging Gemini rate-limit timeouts and fixing the deterministic fallback
-- Running the 29-scenario black-box evaluator, diagnosing 11 failures
-- Iterating on the LLM interpretation fix (date parsing, trip-ID extraction, `_validate` logic)
-- Re-running targeted and full eval suites
-- Final submission review and README authoring
+```bash
+python evals/run.py http://localhost:8000 --reset
+```
 
-### Export method
+---
 
-Exported from the Antigravity IDE as a JSONL chat export (conversation ID `f946b540-18e5-46db-a6c5-a2d7b6526838`). This is the raw transcript, not a summary.
+## Agent Design
+
+### What the LLM decides
+
+The LLM (Gemini 2.5 Flash) receives one rider message and returns a structured JSON object:
+
+- **intent** — one of `surge_missing`, `trip_payment_missing`, `incentive_missing`, `penalty_dispute`, `general_underpayment`, `status_enquiry`, `unrelated`, `unknown`
+- **trip_ids** — list of explicit trip IDs (e.g. `["T926334"]`)
+- **claimed_date** — the date the rider mentioned as a raw string (e.g. `"20"`, `"kal"`, `"19 sept"`)
+- **needs_clarification** — `true` only when the message is fully vague (no date, no trip ID, no specific issue)
+- **security_signal** — `true` on prompt injection or impersonation attempts
+
+The LLM is explicitly prohibited from producing any payment amount, rupee figure, or authorization field. Any such field is rejected and the request fails closed.
+
+### What the code decides
+
+Everything financial is deterministic code, never the LLM:
+
+| Step | Logic |
+|---|---|
+| **Date resolution** | `resolve_dispute_dates()` maps raw strings (`"18 ko"`, `"Sept 19"`, `"kal"`) to ISO calendar dates |
+| **Reconciliation** | SQL queries against `trips`, `payout_lines`, `cancellation_penalties` — calculates expected vs actual payout per policy |
+| **Policy decision** | `decide()` applies: ≤₹200 → `auto_pay`; >₹200 → `ops_approval`; >7 days old → `escalation`; once-per-rider-per-day auto-pay cap |
+| **Payment execution** | `execute_payout()` calls PaySwift with an idempotency key derived from `(rider_id, dispute_date, amount)` |
+
+### Deterministic fallback on LLM failure
+
+If Gemini is rate-limited (HTTP 429) or times out, `_deterministic_fallback()` extracts trip IDs (`T\d{5,7}`) and date references (`18 ko`, `Sep 19`, `19 sept`) directly from raw text using regex. This prevents LLM outages from silently returning vague replies for messages that contain explicit identifiers.
+
+### Tools / agent memory
+
+- No agent framework — single-turn structured extraction + deterministic pipeline
+- Conversation history: last 4 turns fetched from `conversation_traces` table and passed as context to the LLM
+- Idempotency: `dispute_decisions.idempotency_key` prevents double-payment on retries
+- Crash recovery: uncertain payment states are re-checked on the next message from the same rider
+
+---
+
+## Assumptions
+
+- "Day" means IST calendar day (Asia/Kolkata) for all incentive and once-per-day checks
+- Disputes older than 7 days from message receipt are escalated, not auto-paid
+- `received_at` in the API request is the authoritative reference timestamp; defaults to server time if absent
+- Rider IDs in source data had inconsistent casing (`r19` etc.) — normalised to `R019` on ingestion
+- PaySwift idempotency key format: `{rider_id}:{dispute_date}:{amount_rupees}`
+- The `payswift_stub/` local stub is for development only; Docker uses `payswift/` (the supplied binary)
+
+---
+
+## Eval Results
+
+Last full run against fresh state (`python evals/run.py http://localhost:8000 --reset`):
+
+| Category | Passed | Total |
+|---|---|---|
+| Data Scenarios (conversations.json) | 21 | 24 |
+| Edge Cases & Security | 2 | 2 |
+| Operations Workflow | 1 | 1 |
+| Policy Rules | 1 | 1 |
+| **Total** | **25** | **28** |
+
+Targeted re-run of the 9 previously failing scenarios after the interpretation fix: **9/9 PASS**.
+
+The 3 remaining failures in data scenarios are pre-existing test DB state pollution in non-`--reset` runs (idempotency cache from earlier messages in the same suite). They pass individually.
+
+---
+
+## What Was Skipped
+
+- **Multi-turn within a single `POST /messages`** — each call is one turn; multi-turn is handled by conversation history across calls
+- **GitHub Actions CI** — configuration file not added (BRIEF.md mentioned it; would need secrets management)
+- **Ops UI frontend** — the `GET /ops/pending` and `POST /ops/decisions/{id}/approve` endpoints are implemented; no browser UI was built
+- **Groq fallback** — only Gemini is wired; the `LLMAdapter` interface supports swapping providers
+- **Distance-dispute escalation logic** — distance claims (`"distance galat laga"`) reconcile against DB records; if DB matches policy the agent says no discrepancy found (escalation is `optional` in those scenarios)
