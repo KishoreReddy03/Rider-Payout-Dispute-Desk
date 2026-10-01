@@ -102,7 +102,7 @@ The 3 remaining failures in data scenarios are pre-existing test DB state pollut
 
 ## What Was Skipped
 
-- **Multi-turn within a single `POST /messages`** — each call is one turn; multi-turn is handled by conversation history across calls
+- **Multi-turn within a single call `POST /messages`** — each call is one turn; multi-turn is handled by conversation history across calls
 - **GitHub Actions CI** — configuration file not added (BRIEF.md mentioned it; would need secrets management)
 - **Ops UI frontend** — the `GET /ops/pending` and `POST /ops/decisions/{id}/approve` endpoints are implemented; no browser UI was built
 - **Groq fallback** — only Gemini is wired; the `LLMAdapter` interface supports swapping providers
