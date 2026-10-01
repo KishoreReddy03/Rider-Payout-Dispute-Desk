@@ -4,3 +4,41 @@ services:
     build: ./payswift
     ports:
       - "8081:8081"
+
+  postgres:
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      POSTGRES_DB: rider_dispute_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d rider_dispute_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      PORT: 8000
+      HOST: "0.0.0.0"
+      PAYSWIFT_BASE_URL: "http://payswift:8081"
+      DATABASE_URL: "postgresql://postgres:postgres@postgres:5432/rider_dispute_db"
+      LLM_PROVIDER: "${LLM_PROVIDER:-gemini}"
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      payswift:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
